@@ -1,57 +1,123 @@
 import { EventEmitter } from "node:events";
 import WebSocket from "ws";
 import fjp from "fast-json-patch";
-const { applyPatch } = fjp;
+import type { Operation } from "fast-json-patch";
 import { createLogger } from "./logger.js";
 
+const { applyPatch } = fjp;
 const log = createLogger("GoXLR");
 
-const FADERS = ["A", "B", "C", "D"];
+const FADERS = ["A", "B", "C", "D"] as const;
+export type Fader = (typeof FADERS)[number];
+
+export type MuteState = "Unmuted" | "MutedToX" | "MutedToAll";
+
+interface FaderStatus {
+  channel: string;
+  mute_state: MuteState;
+}
+
+interface Mixer {
+  fader_status?: Record<Fader, FaderStatus>;
+  levels?: {
+    volumes?: Record<string, number>;
+  };
+}
+
+export interface GoXLRStatus {
+  mixers?: Record<string, Mixer>;
+}
+
+export interface VolumeChangedEvent {
+  fader: Fader | null;
+  channel: string;
+  value: number;
+}
+
+export interface MuteChangedEvent {
+  fader: Fader;
+  channel: string;
+  muteState: MuteState;
+}
+
+export interface GoXLRClientOptions {
+  url?: string;
+  serial?: string | null;
+  reconnectMs?: number;
+}
+
+type Events = {
+  connected: [{ serial: string; status: GoXLRStatus }];
+  disconnected: [];
+  volume_changed: [VolumeChangedEvent];
+  mute_changed: [MuteChangedEvent];
+};
 
 export class GoXLRClient extends EventEmitter {
-  #url;
-  #ws = null;
-  #status = null;
-  #serial = null;
-  #preferredSerial;
+  #url: string;
+  #ws: WebSocket | null = null;
+  #status: GoXLRStatus | null = null;
+  #serial: string | null = null;
+  #preferredSerial: string | null;
   #nextId = 1;
-  #reconnectMs;
-  #reconnectTimer = null;
+  #reconnectMs: number;
+  #reconnectTimer: NodeJS.Timeout | null = null;
   #intentionalClose = false;
 
-  constructor({ url = "ws://localhost:14564/api/websocket", serial = null, reconnectMs = 3000 } = {}) {
+  constructor({
+    url = "ws://localhost:14564/api/websocket",
+    serial = null,
+    reconnectMs = 3000,
+  }: GoXLRClientOptions = {}) {
     super();
     this.#url = url;
     this.#preferredSerial = serial;
     this.#reconnectMs = reconnectMs;
   }
 
-  get connected() {
+  override on<K extends keyof Events>(
+    event: K,
+    listener: (...args: Events[K]) => void,
+  ): this {
+    return super.on(event, listener as (...args: unknown[]) => void);
+  }
+
+  override off<K extends keyof Events>(
+    event: K,
+    listener: (...args: Events[K]) => void,
+  ): this {
+    return super.off(event, listener as (...args: unknown[]) => void);
+  }
+
+  override emit<K extends keyof Events>(event: K, ...args: Events[K]): boolean {
+    return super.emit(event, ...args);
+  }
+
+  get connected(): boolean {
     return this.#ws?.readyState === WebSocket.OPEN;
   }
 
-  get serial() {
+  get serial(): string | null {
     return this.#serial;
   }
 
-  get status() {
+  get status(): GoXLRStatus | null {
     return this.#status;
   }
 
-  /** Returns the mixer sub-tree for the active serial, or null. */
-  get mixer() {
+  get mixer(): Mixer | null {
     if (!this.#status || !this.#serial) return null;
     return this.#status.mixers?.[this.#serial] ?? null;
   }
 
-  connect() {
+  connect(): void {
     this.#intentionalClose = false;
     this.#openSocket();
   }
 
-  disconnect() {
+  disconnect(): void {
     this.#intentionalClose = true;
-    clearTimeout(this.#reconnectTimer);
+    if (this.#reconnectTimer) clearTimeout(this.#reconnectTimer);
     this.#reconnectTimer = null;
     if (this.#ws) {
       this.#ws.close();
@@ -59,24 +125,22 @@ export class GoXLRClient extends EventEmitter {
     }
   }
 
-  // ── Commands (write to GoXLR Utility) ─────────────────────────────
-
-  /** Set a channel's volume (0-255). Motorized fader will move if channel is on a fader. */
-  async setVolume(channelName, value) {
+  async setVolume(channelName: string, value: number): Promise<void> {
     const v = Math.max(0, Math.min(255, Math.round(value)));
-    return this.#sendCommand({ SetVolume: [channelName, v] });
+    this.#sendCommand({ SetVolume: [channelName, v] });
   }
 
-  /** Set mute state for a fader. muteState: "Unmuted", "MutedToX", "MutedToAll" */
-  async setFaderMuteState(faderName, muteState) {
-    return this.#sendCommand({ SetFaderMuteState: [faderName, muteState] });
+  async setFaderMuteState(faderName: Fader, muteState: MuteState): Promise<void> {
+    this.#sendCommand({ SetFaderMuteState: [faderName, muteState] });
   }
 
-  // ── Internal ──────────────────────────────────────────────────────
-
-  #openSocket() {
+  #openSocket(): void {
     if (this.#ws) {
-      try { this.#ws.close(); } catch {}
+      try {
+        this.#ws.close();
+      } catch {
+        /* ignore */
+      }
       this.#ws = null;
     }
 
@@ -89,14 +153,14 @@ export class GoXLRClient extends EventEmitter {
       this.#send({ id: this.#nextId++, data: "GetStatus" });
     });
 
-    ws.on("message", (raw) => {
-      let msg;
+    ws.on("message", (raw: WebSocket.RawData) => {
+      let msg: unknown;
       try {
         msg = JSON.parse(raw.toString());
       } catch {
         return;
       }
-      this.#handleMessage(msg);
+      this.#handleMessage(msg as { id?: number; data?: unknown });
     });
 
     ws.on("close", () => {
@@ -111,38 +175,36 @@ export class GoXLRClient extends EventEmitter {
       this.#scheduleReconnect();
     });
 
-    ws.on("error", (err) => {
+    ws.on("error", (err: Error) => {
       log.error("WebSocket error:", err.message);
     });
   }
 
-  #handleMessage(msg) {
+  #handleMessage(msg: { id?: number; data?: unknown }): void {
     const data = msg.data;
     if (!data) return;
 
-    // Status response
-    if (data.Status) {
-      this.#onStatusReceived(data.Status);
-      return;
+    if (typeof data === "object" && data !== null) {
+      if ("Status" in data) {
+        this.#onStatusReceived((data as { Status: GoXLRStatus }).Status);
+        return;
+      }
+      if ("Patch" in data) {
+        this.#onPatchReceived((data as { Patch: unknown[] }).Patch);
+        return;
+      }
+      if ("Error" in data) {
+        log.error(`Command error (id ${msg.id}):`, (data as { Error: unknown }).Error);
+        return;
+      }
     }
 
-    // Patch event (broadcast from daemon)
-    if (data.Patch) {
-      this.#onPatchReceived(data.Patch);
-      return;
-    }
-
-    // Command response (Ok / Error)
     if (data === "Ok") return;
-    if (data.Error) {
-      log.error(`Command error (id ${msg.id}):`, data.Error);
-    }
   }
 
-  #onStatusReceived(status) {
+  #onStatusReceived(status: GoXLRStatus): void {
     this.#status = status;
 
-    // Resolve serial
     const serials = Object.keys(status.mixers || {});
     if (serials.length === 0) {
       log.warn("No GoXLR mixers found in status");
@@ -161,7 +223,6 @@ export class GoXLRClient extends EventEmitter {
     const mixer = this.mixer;
     log.info(`Connected to mixer: ${this.#serial}`);
 
-    // Log fader assignments
     for (const f of FADERS) {
       const fs = mixer?.fader_status?.[f];
       if (fs) {
@@ -173,53 +234,46 @@ export class GoXLRClient extends EventEmitter {
     this.emit("connected", { serial: this.#serial, status });
   }
 
-  #onPatchReceived(patches) {
+  #onPatchReceived(patches: unknown[]): void {
     if (!this.#status || !this.#serial) return;
 
-    // Snapshot relevant state before applying patches
     const mixer = this.mixer;
-    const prevVolumes = { ...mixer?.levels?.volumes };
-    const prevMuteStates = {};
+    const prevVolumes: Record<string, number> = { ...(mixer?.levels?.volumes ?? {}) };
+    const prevMuteStates: Partial<Record<Fader, MuteState>> = {};
     for (const f of FADERS) {
       prevMuteStates[f] = mixer?.fader_status?.[f]?.mute_state;
     }
 
-    // Apply patches to local status mirror
     try {
-      applyPatch(this.#status, patches);
+      applyPatch(this.#status as object, patches as Operation[]);
     } catch (e) {
-      log.error("Failed to apply patch:", e.message);
+      log.error("Failed to apply patch:", (e as Error).message);
       return;
     }
 
-    // Diff and emit events
     const updatedMixer = this.mixer;
     if (!updatedMixer) return;
 
-    // Check volume changes
     const volumes = updatedMixer.levels?.volumes;
     if (volumes) {
       for (const [channel, newVal] of Object.entries(volumes)) {
         if (prevVolumes[channel] !== newVal) {
-          // Find which fader (if any) has this channel assigned
           const fader = this.#faderForChannel(channel);
           this.emit("volume_changed", { fader, channel, value: newVal });
         }
       }
     }
 
-    // Check mute state changes
     for (const f of FADERS) {
       const newMuteState = updatedMixer.fader_status?.[f]?.mute_state;
       if (prevMuteStates[f] !== newMuteState && newMuteState != null) {
-        const channel = updatedMixer.fader_status[f].channel;
+        const channel = updatedMixer.fader_status![f].channel;
         this.emit("mute_changed", { fader: f, channel, muteState: newMuteState });
       }
     }
   }
 
-  /** Find which fader (A/B/C/D) is assigned to a given channel, or null. */
-  #faderForChannel(channelName) {
+  #faderForChannel(channelName: string): Fader | null {
     const mixer = this.mixer;
     if (!mixer?.fader_status) return null;
     for (const f of FADERS) {
@@ -228,13 +282,16 @@ export class GoXLRClient extends EventEmitter {
     return null;
   }
 
-  async #sendCommand(command) {
-    if (!this.#serial) throw new Error("No mixer serial available");
+  #sendCommand(command: unknown): void {
+    if (!this.#serial) {
+      log.warn("No mixer serial available, dropping command");
+      return;
+    }
     const id = this.#nextId++;
     this.#send({ id, data: { Command: [this.#serial, command] } });
   }
 
-  #send(obj) {
+  #send(obj: unknown): void {
     if (!this.#ws || this.#ws.readyState !== WebSocket.OPEN) {
       log.warn("Cannot send, WebSocket not open");
       return;
@@ -242,7 +299,7 @@ export class GoXLRClient extends EventEmitter {
     this.#ws.send(JSON.stringify(obj));
   }
 
-  #scheduleReconnect() {
+  #scheduleReconnect(): void {
     if (this.#intentionalClose) return;
     if (this.#reconnectTimer) return;
     log.info(`Reconnecting in ${this.#reconnectMs}ms...`);

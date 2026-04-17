@@ -13,147 +13,229 @@ const VOLUME_WRITE_INTERVAL_MS = 16;
 const VOLUME_WRITE_EPSILON = 0.002;
 const STATE_REFRESH_DEBOUNCE_MS = 120;
 
-function clamp01(v) {
+function clamp01(v: unknown): number {
   const n = Number(v);
   if (!Number.isFinite(n)) return 0;
   return Math.max(0, Math.min(1, n));
 }
 
+export interface MixEntry {
+  id: string;
+  level?: number;
+  volume?: number;
+  isMuted?: boolean;
+  muted?: boolean;
+}
+
+export interface WaveLinkChannel {
+  id: string;
+  name: string;
+  level?: number;
+  volume?: number;
+  isMuted?: boolean;
+  muted?: boolean;
+  mixes?: MixEntry[];
+}
+
+export interface WaveLinkMix {
+  id: string;
+  name: string;
+  level?: number;
+  volume?: number;
+  isMuted?: boolean;
+  muted?: boolean;
+}
+
+export interface WaveLinkVolumeChangedEvent {
+  channelId: string;
+  channelName: string;
+  level: number;
+  mixId: string | null;
+}
+
+export interface WaveLinkMuteChangedEvent {
+  channelId: string;
+  channelName: string;
+  isMuted: boolean;
+  mixId: string | null;
+}
+
+export interface WaveLinkMixVolumeChangedEvent {
+  mixId: string;
+  mixName: string;
+  level: number;
+}
+
+export interface WaveLinkClientOptions {
+  wsInfoPath?: string | null;
+  reconnectMs?: number;
+}
+
+type Events = {
+  connected: [{ channels: WaveLinkChannel[]; mixes: WaveLinkMix[] }];
+  disconnected: [];
+  volume_changed: [WaveLinkVolumeChangedEvent];
+  mute_changed: [WaveLinkMuteChangedEvent];
+  mix_volume_changed: [WaveLinkMixVolumeChangedEvent];
+};
+
+interface Endpoint {
+  identifier: string;
+  mixer_id: string;
+}
+
+interface PendingWrite {
+  endpoint: Endpoint;
+  level: number;
+}
+
+interface RpcRequest {
+  jsonrpc: "2.0";
+  method: string;
+  id: number;
+  params?: Record<string, unknown>;
+}
+
+interface RpcMessage {
+  id?: number;
+  method?: string;
+  result?: unknown;
+}
+
 export class WaveLinkClient extends EventEmitter {
-  #ws = null;
-  #port = null;
-  #wsInfoPath;
-  #reconnectMs;
-  #reconnectTimer = null;
+  #ws: WebSocket | null = null;
+  #port: number | null = null;
+  #wsInfoPath: string | null;
+  #reconnectMs: number;
+  #reconnectTimer: NodeJS.Timeout | null = null;
   #intentionalClose = false;
   #rpcSeq = 10;
 
-  // State
-  #channels = [];
-  #mixes = [];
+  #channels: WaveLinkChannel[] = [];
+  #mixes: WaveLinkMix[] = [];
 
-  // Volume write coalescing
-  #pendingWrites = new Map();
-  #lastSentVolume = new Map();
-  #flushTimer = null;
+  #pendingWrites = new Map<string, PendingWrite>();
+  #lastSentVolume = new Map<string, number>();
+  #flushTimer: NodeJS.Timeout | null = null;
   #flushInFlight = false;
 
-  // State refresh debounce
-  #channelsRefreshTimer = null;
-  #mixesRefreshTimer = null;
+  #channelsRefreshTimer: NodeJS.Timeout | null = null;
+  #mixesRefreshTimer: NodeJS.Timeout | null = null;
 
-  // AppInfo verification
-  #appInfoResolve = null;
-  #appInfoTimer = null;
+  #appInfoResolve: ((result: unknown) => void) | null = null;
+  #appInfoTimer: NodeJS.Timeout | null = null;
 
-  constructor({ wsInfoPath = null, reconnectMs = 3000 } = {}) {
+  constructor({ wsInfoPath = null, reconnectMs = 3000 }: WaveLinkClientOptions = {}) {
     super();
-    this.#wsInfoPath = wsInfoPath || this.#defaultWsInfoPath();
+    this.#wsInfoPath = wsInfoPath ?? this.#defaultWsInfoPath();
     this.#reconnectMs = reconnectMs;
   }
 
-  get connected() {
+  override on<K extends keyof Events>(
+    event: K,
+    listener: (...args: Events[K]) => void,
+  ): this {
+    return super.on(event, listener as (...args: unknown[]) => void);
+  }
+
+  override off<K extends keyof Events>(
+    event: K,
+    listener: (...args: Events[K]) => void,
+  ): this {
+    return super.off(event, listener as (...args: unknown[]) => void);
+  }
+
+  override emit<K extends keyof Events>(event: K, ...args: Events[K]): boolean {
+    return super.emit(event, ...args);
+  }
+
+  get connected(): boolean {
     return this.#ws?.readyState === WebSocket.OPEN;
   }
 
-  get channels() {
+  get channels(): WaveLinkChannel[] {
     return this.#channels;
   }
 
-  get mixes() {
+  get mixes(): WaveLinkMix[] {
     return this.#mixes;
   }
 
-  connect() {
+  connect(): void {
     this.#intentionalClose = false;
-    this.#tryConnect();
+    void this.#tryConnect();
   }
 
-  disconnect() {
+  disconnect(): void {
     this.#intentionalClose = true;
-    clearTimeout(this.#reconnectTimer);
+    if (this.#reconnectTimer) clearTimeout(this.#reconnectTimer);
     this.#reconnectTimer = null;
     this.#cleanup();
   }
 
-  // ── Commands ──────────────────────────────────────────────────────
-
-  /** Set volume for a channel (global). level: 0.0-1.0 */
-  setChannelVolume(channelId, level) {
+  setChannelVolume(channelId: string, level: number): void {
     this.#queueVolumeWrite({ identifier: channelId, mixer_id: "" }, clamp01(level));
   }
 
-  /** Set volume for a channel within a specific mix. level: 0.0-1.0 */
-  setChannelMixVolume(channelId, mixId, level) {
+  setChannelMixVolume(channelId: string, mixId: string, level: number): void {
     this.#queueVolumeWrite({ identifier: channelId, mixer_id: mixId }, clamp01(level));
   }
 
-  /** Set volume for a mix master. level: 0.0-1.0 */
-  setMixVolume(mixId, level) {
+  setMixVolume(mixId: string, level: number): void {
     this.#queueVolumeWrite({ identifier: "", mixer_id: mixId }, clamp01(level));
   }
 
-  /** Set mute for a channel (global). */
-  async setChannelMute(channelId, isMuted) {
+  async setChannelMute(channelId: string, isMuted: boolean): Promise<void> {
     await this.#sendRpc("setChannel", { id: channelId, isMuted: Boolean(isMuted) });
   }
 
-  /** Set mute for a channel within a specific mix. */
-  async setChannelMixMute(channelId, mixId, isMuted) {
+  async setChannelMixMute(channelId: string, mixId: string, isMuted: boolean): Promise<void> {
     await this.#sendRpc("setChannel", {
       id: channelId,
       mixes: [{ id: mixId, isMuted: Boolean(isMuted) }],
     });
   }
 
-  /** Set mute for a mix master. */
-  async setMixMute(mixId, isMuted) {
+  async setMixMute(mixId: string, isMuted: boolean): Promise<void> {
     await this.#sendRpc("setMix", { id: mixId, isMuted: Boolean(isMuted) });
   }
 
-  /** Find a channel by name (case-insensitive). Returns the channel object or null. */
-  findChannelByName(name) {
+  findChannelByName(name: string): WaveLinkChannel | null {
     const lower = name.toLowerCase();
     return this.#channels.find((c) => c.name?.toLowerCase() === lower) ?? null;
   }
 
-  /** Find a mix by name (case-insensitive). Returns the mix object or null. */
-  findMixByName(name) {
+  findMixByName(name: string): WaveLinkMix | null {
     const lower = name.toLowerCase();
     return this.#mixes.find((m) => m.name?.toLowerCase() === lower) ?? null;
   }
 
-  // ── Port Discovery ────────────────────────────────────────────────
-
-  #defaultWsInfoPath() {
+  #defaultWsInfoPath(): string | null {
     const appdata = process.env.APPDATA;
     if (!appdata) return null;
-    // APPDATA is ...\AppData\Roaming, we need ...\AppData\Local
     const base = join(appdata, "..", "Local");
     return join(base, "Packages", "Elgato.WaveLink_g54w8ztgkx496", "LocalState", "ws-info.json");
   }
 
-  #readPort() {
+  #readPort(): number | null {
     if (!this.#wsInfoPath) {
       log.error("No ws-info.json path configured");
       return null;
     }
     try {
       const text = readFileSync(this.#wsInfoPath, "utf-8");
-      const info = JSON.parse(text);
+      const info = JSON.parse(text) as { port?: unknown };
       const port = Number(info.port);
       if (Number.isFinite(port) && port > 0 && port <= 65535) {
         return Math.trunc(port);
       }
     } catch (e) {
-      log.warn(`Cannot read ws-info.json: ${e.message}`);
+      log.warn(`Cannot read ws-info.json: ${(e as Error).message}`);
     }
     return null;
   }
 
-  // ── Connection ────────────────────────────────────────────────────
-
-  async #tryConnect() {
+  async #tryConnect(): Promise<void> {
     const port = this.#readPort();
     if (!port) {
       log.warn("Wave Link port not found, will retry...");
@@ -169,7 +251,7 @@ export class WaveLinkClient extends EventEmitter {
         handshakeTimeout: CONNECT_TIMEOUT_MS,
       });
 
-      const connected = await new Promise((resolve) => {
+      const connected = await new Promise<boolean>((resolve) => {
         const timeout = setTimeout(() => {
           ws.close();
           resolve(false);
@@ -194,10 +276,14 @@ export class WaveLinkClient extends EventEmitter {
       this.#ws = ws;
       this.#port = port;
 
-      ws.on("message", (raw) => {
-        let msg;
-        try { msg = JSON.parse(raw.toString()); } catch { return; }
-        this.#handleMessage(msg);
+      ws.on("message", (raw: WebSocket.RawData) => {
+        let msg: unknown;
+        try {
+          msg = JSON.parse(raw.toString());
+        } catch {
+          return;
+        }
+        this.#handleMessage(msg as RpcMessage);
       });
 
       ws.on("close", () => {
@@ -209,11 +295,10 @@ export class WaveLinkClient extends EventEmitter {
         }
       });
 
-      ws.on("error", (err) => {
+      ws.on("error", (err: Error) => {
         log.error("WebSocket error:", err.message);
       });
 
-      // Verify this is actually Wave Link
       const verified = await this.#verifyAppInfo();
       if (!verified) {
         log.warn("Failed to verify Wave Link application info");
@@ -224,59 +309,52 @@ export class WaveLinkClient extends EventEmitter {
 
       log.info(`Connected to Wave Link on port ${port}`);
 
-      // Request full state
       await this.#requestFullState();
 
       this.emit("connected", { channels: this.#channels, mixes: this.#mixes });
     } catch (e) {
-      log.error("Connection error:", e.message);
+      log.error("Connection error:", (e as Error).message);
       this.#scheduleReconnect();
     }
   }
 
-  async #verifyAppInfo() {
-    return new Promise((resolve) => {
+  async #verifyAppInfo(): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
       this.#appInfoTimer = setTimeout(() => {
         this.#appInfoResolve = null;
         resolve(false);
       }, APP_INFO_TIMEOUT_MS);
 
-      this.#appInfoResolve = (result) => {
-        clearTimeout(this.#appInfoTimer);
+      this.#appInfoResolve = (result: unknown) => {
+        if (this.#appInfoTimer) clearTimeout(this.#appInfoTimer);
         this.#appInfoResolve = null;
         this.#appInfoTimer = null;
-        resolve(result && typeof result === "object");
+        resolve(result != null && typeof result === "object");
       };
 
       this.#sendRaw({ jsonrpc: "2.0", method: "getApplicationInfo", id: 1 });
     });
   }
 
-  async #requestFullState() {
+  async #requestFullState(): Promise<void> {
     this.#sendRaw({ jsonrpc: "2.0", method: "getMixes", id: 2 });
     this.#sendRaw({ jsonrpc: "2.0", method: "getChannels", id: 3 });
-
-    // Wait a bit for responses to arrive
     await new Promise((r) => setTimeout(r, 200));
   }
 
-  // ── Message Handling ──────────────────────────────────────────────
-
-  #handleMessage(msg) {
+  #handleMessage(msg: RpcMessage): void {
     if (!msg || typeof msg !== "object") return;
 
     const id = msg.id;
 
-    // AppInfo response (id=1)
     if (id === 1) {
-      if (this.#appInfoResolve) this.#appInfoResolve(msg.result || null);
+      if (this.#appInfoResolve) this.#appInfoResolve(msg.result ?? null);
       return;
     }
 
-    // getMixes response (id=2)
     if (id === 2) {
-      const result = msg.result;
-      const payload = result?.mixes ?? result;
+      const result = msg.result as { mixes?: WaveLinkMix[] } | WaveLinkMix[] | undefined;
+      const payload = Array.isArray(result) ? result : result?.mixes;
       if (Array.isArray(payload)) {
         const prevMixes = this.#mixes;
         this.#mixes = payload;
@@ -286,10 +364,9 @@ export class WaveLinkClient extends EventEmitter {
       return;
     }
 
-    // getChannels response (id=3)
     if (id === 3) {
-      const result = msg.result;
-      const payload = result?.channels ?? result;
+      const result = msg.result as { channels?: WaveLinkChannel[] } | WaveLinkChannel[] | undefined;
+      const payload = Array.isArray(result) ? result : result?.channels;
       if (Array.isArray(payload)) {
         const prevChannels = this.#channels;
         this.#channels = payload;
@@ -299,7 +376,6 @@ export class WaveLinkClient extends EventEmitter {
       return;
     }
 
-    // Notifications (no id, has method)
     if (msg.method) {
       if (msg.method === "channelsChanged" || msg.method === "channelChanged") {
         this.#scheduleChannelsRefresh();
@@ -310,15 +386,18 @@ export class WaveLinkClient extends EventEmitter {
     }
   }
 
-  #emitChannelChanges(prev, next) {
+  #emitChannelChanges(prev: WaveLinkChannel[], next: WaveLinkChannel[]): void {
     for (const ch of next) {
       const old = prev.find((c) => c.id === ch.id);
       if (!old) continue;
 
-      // Global level change
       const oldLevel = old.level ?? old.volume;
       const newLevel = ch.level ?? ch.volume;
-      if (oldLevel != null && newLevel != null && Math.abs(oldLevel - newLevel) > VOLUME_WRITE_EPSILON) {
+      if (
+        oldLevel != null &&
+        newLevel != null &&
+        Math.abs(oldLevel - newLevel) > VOLUME_WRITE_EPSILON
+      ) {
         this.emit("volume_changed", {
           channelId: ch.id,
           channelName: ch.name,
@@ -327,7 +406,6 @@ export class WaveLinkClient extends EventEmitter {
         });
       }
 
-      // Global mute change
       const oldMuted = old.isMuted ?? old.muted;
       const newMuted = ch.isMuted ?? ch.muted;
       if (oldMuted !== newMuted && typeof newMuted === "boolean") {
@@ -339,7 +417,6 @@ export class WaveLinkClient extends EventEmitter {
         });
       }
 
-      // Per-mix changes
       if (Array.isArray(ch.mixes) && Array.isArray(old.mixes)) {
         for (const mixEntry of ch.mixes) {
           const oldEntry = old.mixes.find((m) => m.id === mixEntry.id);
@@ -347,7 +424,11 @@ export class WaveLinkClient extends EventEmitter {
 
           const oel = oldEntry.level ?? oldEntry.volume;
           const nel = mixEntry.level ?? mixEntry.volume;
-          if (oel != null && nel != null && Math.abs(oel - nel) > VOLUME_WRITE_EPSILON) {
+          if (
+            oel != null &&
+            nel != null &&
+            Math.abs(oel - nel) > VOLUME_WRITE_EPSILON
+          ) {
             this.emit("volume_changed", {
               channelId: ch.id,
               channelName: ch.name,
@@ -371,14 +452,18 @@ export class WaveLinkClient extends EventEmitter {
     }
   }
 
-  #emitMixChanges(prev, next) {
+  #emitMixChanges(prev: WaveLinkMix[], next: WaveLinkMix[]): void {
     for (const mix of next) {
       const old = prev.find((m) => m.id === mix.id);
       if (!old) continue;
 
       const oldLevel = old.level ?? old.volume;
       const newLevel = mix.level ?? mix.volume;
-      if (oldLevel != null && newLevel != null && Math.abs(oldLevel - newLevel) > VOLUME_WRITE_EPSILON) {
+      if (
+        oldLevel != null &&
+        newLevel != null &&
+        Math.abs(oldLevel - newLevel) > VOLUME_WRITE_EPSILON
+      ) {
         this.emit("mix_volume_changed", {
           mixId: mix.id,
           mixName: mix.name,
@@ -388,9 +473,7 @@ export class WaveLinkClient extends EventEmitter {
     }
   }
 
-  // ── State Refresh ─────────────────────────────────────────────────
-
-  #scheduleChannelsRefresh() {
+  #scheduleChannelsRefresh(): void {
     if (this.#channelsRefreshTimer) return;
     this.#channelsRefreshTimer = setTimeout(() => {
       this.#channelsRefreshTimer = null;
@@ -399,7 +482,7 @@ export class WaveLinkClient extends EventEmitter {
     }, STATE_REFRESH_DEBOUNCE_MS);
   }
 
-  #scheduleMixesRefresh() {
+  #scheduleMixesRefresh(): void {
     if (this.#mixesRefreshTimer) return;
     this.#mixesRefreshTimer = setTimeout(() => {
       this.#mixesRefreshTimer = null;
@@ -408,13 +491,11 @@ export class WaveLinkClient extends EventEmitter {
     }, STATE_REFRESH_DEBOUNCE_MS);
   }
 
-  // ── Volume Write Coalescing ───────────────────────────────────────
-
-  #endpointKey(ep) {
+  #endpointKey(ep: Endpoint): string {
     return `${ep.identifier || ""}::${ep.mixer_id || ""}`;
   }
 
-  #queueVolumeWrite(endpoint, level) {
+  #queueVolumeWrite(endpoint: Endpoint, level: number): void {
     const key = this.#endpointKey(endpoint);
     const prev = this.#pendingWrites.get(key);
     if (prev && Math.abs(prev.level - level) < VOLUME_WRITE_EPSILON) return;
@@ -424,15 +505,15 @@ export class WaveLinkClient extends EventEmitter {
     this.#scheduleFlush();
   }
 
-  #scheduleFlush() {
+  #scheduleFlush(): void {
     if (this.#flushTimer) return;
     this.#flushTimer = setTimeout(() => {
       this.#flushTimer = null;
-      this.#flushWrites();
+      void this.#flushWrites();
     }, VOLUME_WRITE_INTERVAL_MS);
   }
 
-  async #flushWrites() {
+  async #flushWrites(): Promise<void> {
     if (this.#flushInFlight) return;
     if (!this.#ws) {
       this.#pendingWrites.clear();
@@ -445,13 +526,10 @@ export class WaveLinkClient extends EventEmitter {
       for (const { endpoint, level } of writes) {
         if (!this.#ws) break;
         if (!endpoint.identifier) {
-          // Mix master
           await this.#sendRpc("setMix", { id: endpoint.mixer_id, level });
         } else if (!endpoint.mixer_id) {
-          // Channel global
           await this.#sendRpc("setChannel", { id: endpoint.identifier, level });
         } else {
-          // Channel within specific mix
           await this.#sendRpc("setChannel", {
             id: endpoint.identifier,
             mixes: [{ id: endpoint.mixer_id, level }],
@@ -460,7 +538,6 @@ export class WaveLinkClient extends EventEmitter {
         this.#lastSentVolume.set(this.#endpointKey(endpoint), level);
       }
     } catch {
-      // Connection may have died
       this.#cleanup();
     } finally {
       this.#flushInFlight = false;
@@ -468,53 +545,53 @@ export class WaveLinkClient extends EventEmitter {
     }
   }
 
-  // ── JSON-RPC ──────────────────────────────────────────────────────
-
-  async #sendRpc(method, params) {
+  async #sendRpc(method: string, params?: Record<string, unknown>): Promise<void> {
     this.#rpcSeq++;
     if (this.#rpcSeq > 2_000_000_000) this.#rpcSeq = 10;
-    const req = { jsonrpc: "2.0", method, id: this.#rpcSeq };
+    const req: RpcRequest = { jsonrpc: "2.0", method, id: this.#rpcSeq };
     if (params && typeof params === "object" && Object.keys(params).length > 0) {
       req.params = params;
     }
     this.#sendRaw(req);
   }
 
-  #sendRaw(obj) {
+  #sendRaw(obj: unknown): void {
     if (!this.#ws || this.#ws.readyState !== WebSocket.OPEN) return;
     this.#ws.send(JSON.stringify(obj));
   }
 
-  // ── Lifecycle ─────────────────────────────────────────────────────
-
-  #cleanup() {
+  #cleanup(): void {
     if (this.#ws) {
-      try { this.#ws.close(); } catch {}
+      try {
+        this.#ws.close();
+      } catch {
+        /* ignore */
+      }
       this.#ws = null;
     }
     this.#port = null;
     this.#pendingWrites.clear();
     this.#lastSentVolume.clear();
-    clearTimeout(this.#flushTimer);
+    if (this.#flushTimer) clearTimeout(this.#flushTimer);
     this.#flushTimer = null;
-    clearTimeout(this.#channelsRefreshTimer);
+    if (this.#channelsRefreshTimer) clearTimeout(this.#channelsRefreshTimer);
     this.#channelsRefreshTimer = null;
-    clearTimeout(this.#mixesRefreshTimer);
+    if (this.#mixesRefreshTimer) clearTimeout(this.#mixesRefreshTimer);
     this.#mixesRefreshTimer = null;
-    clearTimeout(this.#appInfoTimer);
+    if (this.#appInfoTimer) clearTimeout(this.#appInfoTimer);
     this.#appInfoTimer = null;
     this.#appInfoResolve = null;
     this.#channels = [];
     this.#mixes = [];
   }
 
-  #scheduleReconnect() {
+  #scheduleReconnect(): void {
     if (this.#intentionalClose) return;
     if (this.#reconnectTimer) return;
     log.info(`Reconnecting in ${this.#reconnectMs}ms...`);
     this.#reconnectTimer = setTimeout(() => {
       this.#reconnectTimer = null;
-      this.#tryConnect();
+      void this.#tryConnect();
     }, this.#reconnectMs);
   }
 }

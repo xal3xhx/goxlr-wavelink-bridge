@@ -1,0 +1,44 @@
+appId: com.alexhansen.goxlr-wavelink-bridge
+productName: GoXLR-WaveLink Bridge
+copyright: Copyright © 2026 Alex Hansen
+
+directories:
+  output: release
+  buildResources: build
+
+files:
+  - out/**/*
+  - package.json
+  - "!**/{.DS_Store,Thumbs.db,*.map}"
+
+asar: true
+
+extraResources:
+  - from: icons
+    to: icons
+    filter: ["*.ico"]
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  artifactName: ${productName}-${version}-${arch}.${ext}
+  icon: build/icon.ico
+  requestedExecutionLevel: asInvoker
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: GoXLR-WaveLink Bridge
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+  deleteAppDataOnUninstall: false
+
+publish:
+  - provider: github
+    owner: xal3xhx
+    repo: goxlr-wavelink-bridge
+    releaseType: release

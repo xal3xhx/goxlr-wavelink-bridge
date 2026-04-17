@@ -1,5 +1,17 @@
 node_modules/
+out/
+dist/
+release/
 *.log
+logs/
+.DS_Store
+Thumbs.db
+
+# Electron build caches
+.electron-vite-cache/
+
+# TypeScript incremental build info
+*.tsbuildinfo
+
+# Config (user-specific)
 config.json
-tray-helper/bin/
-tray-helper/obj/

@@ -1,17 +1,47 @@
 {
   "name": "goxlr-wavelink-bridge",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "Bidirectional bridge between GoXLR faders and Elgato Wave Link 3",
+  "author": "Alex Hansen",
+  "license": "MIT",
+  "homepage": "https://github.com/xal3xhx/goxlr-wavelink-bridge",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xal3xhx/goxlr-wavelink-bridge.git"
+  },
   "type": "module",
-  "main": "src/main.js",
+  "main": "./out/main/main.js",
   "scripts": {
-    "start": "node src/main.js",
-    "test:goxlr": "node src/test-goxlr.js",
-    "test:wavelink": "node src/test-wavelink.js"
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
+    "typecheck:web": "tsc --noEmit -p tsconfig.web.json",
+    "typecheck": "npm run typecheck:node && npm run typecheck:web",
+    "dist": "electron-vite build && electron-builder",
+    "dist:dir": "electron-vite build && electron-builder --dir",
+    "postinstall": "electron-builder install-app-deps"
   },
   "dependencies": {
+    "electron-store": "^11.0.0",
+    "electron-updater": "^6.6.2",
     "fast-json-patch": "^3.1.1",
-    "open": "^10.1.0",
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@types/ws": "^8.5.13",
+    "@vitejs/plugin-react": "^5.0.0",
+    "@tailwindcss/vite": "^4.0.0",
+    "electron": "^37.0.0",
+    "electron-builder": "^26.0.12",
+    "electron-vite": "^4.0.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5"
   }
 }
