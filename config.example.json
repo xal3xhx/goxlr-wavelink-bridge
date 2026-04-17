@@ -1,0 +1,26 @@
+{
+  "goxlr": {
+    "url": "ws://localhost:14564/api/websocket",
+    "serial": null
+  },
+  "wavelink": {
+    "ws_info_path": null
+  },
+  "mappings": [
+    {
+      "goxlr_fader": "B",
+      "goxlr_dummy_channel": "Music",
+      "wavelink_channel_name": "My Channel",
+      "wavelink_channel_id": "PCM_OUT_00_V_14_SD8",
+      "mix_target": "both",
+      "sync_volume": true,
+      "sync_mute": true
+    }
+  ],
+  "options": {
+    "volume_write_interval_ms": 16,
+    "reconnect_interval_ms": 3000,
+    "echo_suppress_ms": 500,
+    "start_minimized": true
+  }
+}

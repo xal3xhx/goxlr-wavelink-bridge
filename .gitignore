@@ -1,0 +1,5 @@
+node_modules/
+*.log
+config.json
+tray-helper/bin/
+tray-helper/obj/
